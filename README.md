@@ -4,9 +4,9 @@
 
 2- git pull origin main
 
-3- cp src/comov.cc ~/COMOV/ns-3/scratch/comov.cc
+3- cp COMOV-Project/src/comov.cc ~/COMOV/ns-3/scratch/comov.cc
 
-onde src/comov.cc é o que foi clonado e ~/COMOV/ns-3/scratch/comov.cc deverá de ser uma pasta que contem o ns-3 instalado. Poderá não ser igual.
+onde "COMOV-Projec/src/comov.cc" é o que foi clonado e "~/COMOV/ns-3/scratch/comov.cc" deverá de ser uma pasta que contém o ns-3 instalado. O caminho poderá não ser igual.
 
 4- cd ~/COMOV/ns-3
 
