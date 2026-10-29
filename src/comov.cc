@@ -1,18 +1,14 @@
-/*
- * COMOV - Comunicacao V2I com IEEE 802.11p (ns-3.48)
+    /*
+ * COMOV - Pedidos de prioridade V2I em IEEE 802.11p (ns-3.48)
  *
  * Adaptado de examples/wireless/wifi-simple-adhoc.cc:
  * Copyright (c) 2009 The Boeing Company
  * SPDX-License-Identifier: GPL-2.0-only
  *
- * Cenario:
- *   No 0: RSU fixa em (0, 0, 0)
- *   No 1: autocarro que parte de (-initialDistance, 0, 0)
- *         e se desloca com velocidade constante +speed no eixo X.
- *
- * O autocarro envia pacotes UDP broadcast. O SeqTsHeader de 12 bytes
- * transporta o numero sequencial e o instante de envio.
- * Os resultados sao guardados por pacote num ficheiro CSV para o Excel.
+ * Etapa: RSU fixa + N autocarros moveis (N configuravel).
+ * Mantem-se UDP broadcast, como na versao funcional anterior,
+ * para testar apenas a transicao de 1 para N autocarros.
+ * Os CSV registam os pacotes de cada autocarro individualmente.
  */
 
 #include "ns3/command-line.h"
@@ -28,26 +24,28 @@
 #include "ns3/string.h"
 #include "ns3/yans-wifi-channel.h"
 #include "ns3/yans-wifi-helper.h"
+#include "ns3/random-variable-stream.h"
+#include "ns3/wifi-net-device.h"
+#include "ns3/wifi-phy.h"
 
 #include <cstdint>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <locale>
 #include <map>
 #include <string>
+#include <vector>
 
 using namespace ns3;
 
 NS_LOG_COMPONENT_DEFINE("Comov");
 
-// Contadores ao nivel da aplicacao UDP.
-uint32_t txPackets = 0;
-uint32_t rxPackets = 0;
-double totalDelayMs = 0.0;
-
 struct PacketData
 {
+    uint32_t busId = 0;      // 1, 2, ..., nBuses
+    uint32_t busPacket = 0;  // indice local do pacote
     double txTime = 0.0;    // segundos
     double distance = 0.0;  // metros, no instante TX
     bool received = false;
@@ -55,10 +53,30 @@ struct PacketData
     double delayMs = 0.0;   // milissegundos
 };
 
-// Chave: numero sequencial (neste momento existe apenas um autocarro).
-std::map<uint32_t, PacketData> packetRecords;
+static uint32_t gPhyRxDrops = 0;
 
-// CSV separado por ponto e virgula e com virgula decimal: Excel em PT.
+static void
+OnPhyRxDrop(Ptr<const Packet> packet,
+            WifiPhyRxfailureReason reason)
+{
+    ++gPhyRxDrops;
+
+    NS_LOG_UNCOND("PHY RX DROP | t="
+                  << Simulator::Now().GetSeconds()
+                  << " s | reason="
+                  << reason
+}
+
+static uint32_t gNextSeq = 0;
+static uint32_t gTxPackets = 0;
+static uint32_t gRxPackets = 0;
+static double gTotalDelayMs = 0.0;
+static std::vector<uint32_t> gTxByBus;
+static std::vector<uint32_t> gRxByBus;
+static std::vector<double> gDelayByBus;
+static std::map<uint32_t, PacketData> gRecords;
+
+// Ficheiros compatíveis com Excel em portugues: ';' e virgula decimal.
 class CsvDecimalComma : public std::numpunct<char>
 {
   protected:
@@ -68,111 +86,105 @@ class CsvDecimalComma : public std::numpunct<char>
     }
 };
 
-void
+static void
 ReceivePacket(Ptr<Socket> socket)
 {
     Ptr<Packet> packet;
-
     while ((packet = socket->Recv()))
     {
         SeqTsHeader header;
         if (packet->GetSize() < header.GetSerializedSize())
         {
-            NS_LOG_UNCOND("RX ERROR | Pacote demasiado pequeno para SeqTsHeader");
+            NS_LOG_UNCOND("RX ERROR | pacote demasiado pequeno");
             continue;
         }
-
         packet->RemoveHeader(header);
-
-        uint32_t seq = header.GetSeq();
-        Time txTime = header.GetTs();
-        Time rxTime = Simulator::Now();
-        double delayMs = (rxTime - txTime).GetSeconds() * 1000.0;
-
-        auto it = packetRecords.find(seq);
-        if (it == packetRecords.end())
+        const uint32_t seq = header.GetSeq();
+        const auto it = gRecords.find(seq);
+        if (it == gRecords.end())
         {
-            NS_LOG_UNCOND("RX ERROR | Pacote " << seq << " sem registo TX");
+            NS_LOG_UNCOND("RX ERROR | pacote sem registo TX: " << seq);
             continue;
         }
         if (it->second.received)
         {
-            NS_LOG_UNCOND("RX DUPLICATE | Pacote " << seq);
+            NS_LOG_UNCOND("RX DUPLICATE | pacote " << seq);
             continue;
         }
 
-        it->second.received = true;
-        it->second.rxTime = rxTime.GetSeconds();
-        it->second.delayMs = delayMs;
+        const double delayMs = (Simulator::Now() - header.GetTs()).GetSeconds() * 1000.0;
+        PacketData& data = it->second;
+        data.received = true;
+        data.rxTime = Simulator::Now().GetSeconds();
+        data.delayMs = delayMs;
 
-        rxPackets++;
-        totalDelayMs += delayMs;
+        ++gRxPackets;
+        ++gRxByBus[data.busId - 1];
+        gTotalDelayMs += delayMs;
+        gDelayByBus[data.busId - 1] += delayMs;
 
-        NS_LOG_UNCOND("RX | Packet " << seq
-                       << " | TX: " << txTime.GetSeconds() << " s"
-                       << " | RX: " << rxTime.GetSeconds() << " s"
-                       << " | Delay: " << delayMs << " ms");
+        NS_LOG_UNCOND("RX | BUS " << data.busId << " | seq " << seq
+                      << " | delay " << delayMs << " ms");
     }
 }
 
 static void
 GenerateTraffic(Ptr<Socket> socket,
+                uint32_t busId,
+                Ptr<MobilityModel> rsuMobility,
                 uint32_t pktSize,
-                uint32_t pktCount,
+                uint32_t remaining,
+                uint32_t busPacket,
                 Time pktInterval)
 {
-    if (pktCount == 0)
+    if (remaining == 0)
     {
         socket->Close();
         return;
     }
 
-    SeqTsHeader header;  // Timestamp = Simulator::Now() neste instante
-    uint32_t seq = txPackets + 1;
-    header.SetSeq(seq);
+    Ptr<MobilityModel> busMobility = socket->GetNode()->GetObject<MobilityModel>();
+    NS_ABORT_MSG_IF(!busMobility, "BUS sem MobilityModel");
 
-    uint32_t headerSize = header.GetSerializedSize();
+    SeqTsHeader header;
+    const uint32_t seq = ++gNextSeq; // numero global unico para todos os BUS
+    header.SetSeq(seq);
+    const uint32_t headerSize = header.GetSerializedSize();
     NS_ABORT_MSG_IF(pktSize < headerSize, "packetSize deve ser >= 12 bytes");
 
     Ptr<Packet> packet = Create<Packet>(pktSize - headerSize);
     packet->AddHeader(header);
 
-    // Medir a distancia real ao longo da trajetoria do autocarro.
-    Ptr<MobilityModel> busMobility = socket->GetNode()->GetObject<MobilityModel>();
-    NS_ABORT_MSG_IF(!busMobility, "O autocarro nao tem MobilityModel");
-
-    Vector position = busMobility->GetPosition();
-    // Neste cenario, a RSU esta fixa em (0, 0, 0).
-    double currentDistance = CalculateDistance(position, Vector(0.0, 0.0, 0.0));
-
-    int bytesSent = socket->Send(packet);
-
-    if (bytesSent == static_cast<int>(packet->GetSize()))
+    const double distance = busMobility->GetDistanceFrom(rsuMobility);
+    const int sent = socket->Send(packet);
+    if (sent == static_cast<int>(packet->GetSize()))
     {
-        txPackets++;
+        PacketData data;
+        data.busId = busId;
+        data.busPacket = busPacket;
+        data.txTime = Simulator::Now().GetSeconds();
+        data.distance = distance;
+        gRecords[seq] = data;
+        ++gTxPackets;
+        ++gTxByBus[busId - 1];
 
-        PacketData record;
-        record.txTime = Simulator::Now().GetSeconds();
-        record.distance = currentDistance;
-        packetRecords[seq] = record;
-
-        NS_LOG_UNCOND("TX | Packet " << seq
-                       << " | Time: " << record.txTime << " s"
-                       << " | Position X: " << position.x << " m"
-                       << " | Distance: " << currentDistance << " m"
-                       << " | Size: " << packet->GetSize() << " bytes");
+        NS_LOG_UNCOND("TX | BUS " << busId << " | seq " << seq
+                      << " | t " << data.txTime << " s"
+                      << " | d " << distance << " m");
     }
     else
     {
-        NS_LOG_UNCOND("TX ERROR | Falha ao enviar o pacote " << seq);
+        NS_LOG_UNCOND("TX ERROR | BUS " << busId << " | seq " << seq);
     }
 
-    // Mantem o agendamento original, incluindo o ultimo evento de fecho.
     Simulator::Schedule(pktInterval,
                         &GenerateTraffic,
                         socket,
+                        busId,
+                        rsuMobility,
                         pktSize,
-                        pktCount - 1,
+                        remaining - 1,
+                        busPacket + 1,
                         pktInterval);
 }
 
@@ -180,83 +192,90 @@ static void
 ExportCsv(const std::string& filename)
 {
     std::ofstream csv(filename);
-    NS_ABORT_MSG_IF(!csv.is_open(), "Nao foi possivel criar o ficheiro CSV: " << filename);
-
-    // Forca virgula decimal sem depender das locales instaladas no Ubuntu.
+    NS_ABORT_MSG_IF(!csv.is_open(), "Nao foi possivel criar CSV: " << filename);
     csv.imbue(std::locale(std::locale::classic(), new CsvDecimalComma));
     csv << std::fixed << std::setprecision(6);
-    csv << "Pacote;TX_s;Distancia_m;Recebido;RX_s;Delay_ms\n";
+    csv << "BusId;PacoteBus;Sequencia;TX_s;Distancia_m;Recebido;RX_s;Delay_ms\n";
 
-    for (const auto& [seq, data] : packetRecords)
+    for (const auto& [seq, data] : gRecords)
     {
-        csv << seq << ';'
-            << data.txTime << ';'
-            << data.distance << ';'
+        csv << data.busId << ';' << data.busPacket << ';' << seq << ';'
+            << data.txTime << ';' << data.distance << ';'
             << (data.received ? 1 : 0) << ';';
-
         if (data.received)
         {
             csv << data.rxTime << ';' << data.delayMs;
         }
         else
         {
-            csv << ';'; // RX_s e Delay_ms ficam vazios
+            csv << ';'; // RX_s e Delay_ms vazios quando nao recebido
         }
         csv << '\n';
     }
-
     csv.close();
-    NS_ABORT_MSG_IF(!csv, "Falha ao escrever o CSV: " << filename);
+    NS_ABORT_MSG_IF(!csv, "Erro de escrita no CSV");
     std::cout << "CSV exportado: " << filename << '\n';
 }
 
 int
 main(int argc, char* argv[])
 {
-    // Parametros da simulacao
     const std::string phyMode{"OfdmRate6MbpsBW10MHz"};
+    uint32_t nBuses{2};
     double initialDistance{200.0};
     double speed{10.0};
+    double busSpacing{0.0}; // 0 m: mesma geometria radio para comparar contencao
     double pathLossExponent{2.0};
     uint32_t packetSize{100};
-    uint32_t numPackets{10};
+    uint32_t numPackets{10}; // por autocarro
     Time interPacketInterval{"100ms"};
     bool verbose{false};
-    std::string outputCsv{"comov_pacotes.csv"};
+    std::string outputCsv{"comov_multibus.csv"};
 
     CommandLine cmd(__FILE__);
-    cmd.AddValue("initialDistance", "Distancia inicial (m)", initialDistance);
-    cmd.AddValue("speed", "Velocidade do autocarro (m/s)", speed);
+    cmd.AddValue("nBuses", "Numero de autocarros", nBuses);
+    cmd.AddValue("initialDistance", "Distancia inicial do primeiro BUS (m)", initialDistance);
+    cmd.AddValue("speed", "Velocidade de todos os BUS (m/s)", speed);
+    cmd.AddValue("busSpacing", "Espacamento longitudinal entre BUS (m)", busSpacing);
     cmd.AddValue("pathLossExponent", "Expoente de propagacao", pathLossExponent);
     cmd.AddValue("packetSize", "Tamanho do pacote UDP (bytes)", packetSize);
-    cmd.AddValue("numPackets", "Numero de pacotes", numPackets);
-    cmd.AddValue("interval", "Intervalo entre pacotes", interPacketInterval);
+    cmd.AddValue("numPackets", "Pacotes enviados por cada BUS", numPackets);
+    cmd.AddValue("interval", "Intervalo entre pacotes por BUS", interPacketInterval);
     cmd.AddValue("verbose", "Ativar logs Wi-Fi", verbose);
-    cmd.AddValue("outputCsv", "Nome/caminho do CSV de resultados", outputCsv);
+    cmd.AddValue("outputCsv", "Nome/caminho do CSV", outputCsv);
     cmd.Parse(argc, argv);
 
-    NS_ABORT_MSG_IF(initialDistance < 0.0, "initialDistance nao pode ser negativa");
-    NS_ABORT_MSG_IF(speed < 0.0, "speed nao pode ser negativa neste cenario");
+    NS_ABORT_MSG_IF(nBuses < 1 || nBuses > 100, "nBuses deve estar entre 1 e 100");
+    NS_ABORT_MSG_IF(initialDistance < 0.0 || speed < 0.0 || busSpacing < 0.0,
+                    "Distancias e velocidades devem ser nao negativas");
     NS_ABORT_MSG_IF(pathLossExponent <= 0.0, "pathLossExponent deve ser positivo");
     NS_ABORT_MSG_IF(packetSize < 12, "packetSize deve ser >= 12 bytes");
     NS_ABORT_MSG_IF(interPacketInterval <= Seconds(0), "interval deve ser positivo");
+    NS_ABORT_MSG_IF(static_cast<uint64_t>(nBuses) * numPackets >
+                        std::numeric_limits<uint32_t>::max(),
+                    "Numero de sequencias ultrapassa uint32_t");
 
-    std::cout << "\n========== INFO COMOV ==========\n";
-    std::cout << "Standard: IEEE 802.11p\n";
-    std::cout << "PHY mode: " << phyMode << '\n';
-    std::cout << "Distancia inicial: " << initialDistance << " m\n";
-    std::cout << "Velocidade: " << speed << " m/s\n";
-    std::cout << "Expoente propagacao: " << pathLossExponent << '\n';
-    std::cout << "Tamanho pacote: " << packetSize << " bytes\n";
-    std::cout << "Numero de pacotes: " << numPackets << '\n';
-    std::cout << "Intervalo: " << interPacketInterval.GetMilliSeconds() << " ms\n";
-    std::cout << "CSV: " << outputCsv << '\n';
-    std::cout << "================================\n\n";
+    gTxByBus.assign(nBuses, 0);
+    gRxByBus.assign(nBuses, 0);
+    gDelayByBus.assign(nBuses, 0.0);
+
+    std::cout << "\n========== INFO COMOV ==========\n"
+              << "Padrao: IEEE 802.11p | modo: " << phyMode << '\n'
+              << "RSU: 1 | BUS: " << nBuses << '\n'
+              << "Distancia inicial: " << initialDistance << " m\n"
+              << "Espacamento: " << busSpacing << " m\n"
+              << "Velocidade: " << speed << " m/s\n"
+              << "Expoente propagacao: " << pathLossExponent << '\n'
+              << "Pacotes por BUS: " << numPackets << '\n'
+              << "Tamanho: " << packetSize << " bytes\n"
+              << "Intervalo: " << interPacketInterval.GetMilliSeconds() << " ms\n"
+              << "Destino: broadcast (baseline anterior)\n"
+              << "================================\n";
 
     Config::SetDefault("ns3::WifiRemoteStationManager::NonUnicastMode", StringValue(phyMode));
 
-    NodeContainer c;
-    c.Create(2); // No 0 = RSU; No 1 = BUS
+    NodeContainer nodes;
+    nodes.Create(nBuses + 1); // 0 = RSU; 1..N = BUS
 
     WifiHelper wifi;
     if (verbose)
@@ -283,83 +302,133 @@ main(int argc, char* argv[])
                                  "ControlMode",
                                  StringValue(phyMode));
     wifiMac.SetType("ns3::AdhocWifiMac");
-    NetDeviceContainer devices = wifi.Install(wifiPhy, wifiMac, c);
+    NetDeviceContainer devices = wifi.Install(wifiPhy, wifiMac, nodes);
 
-    // Mobilidade: RSU fixa na origem; BUS aproxima-se da origem.
+    Ptr<WifiNetDevice> rsuDevice = DynamicCast<WifiNetDevice>(devices.Get(0));
+
+    NS_ABORT_MSG_IF(!rsuDevice, "RSU sem WifiNetDevice");
+
+    bool connected = rsuDevice->GetPhy()->TraceConnectWithoutContext(
+        "PhyRxDrop",
+        MakeCallback(&OnPhyRxDrop));
+
+    NS_ABORT_MSG_IF(!connected, "Falha ao ligar PhyRxDrop");
+
     MobilityHelper mobility;
     Ptr<ListPositionAllocator> positionAlloc = CreateObject<ListPositionAllocator>();
-    positionAlloc->Add(Vector(0.0, 0.0, 0.0));
-    positionAlloc->Add(Vector(-initialDistance, 0.0, 0.0));
+    positionAlloc->Add(Vector(0.0, 0.0, 0.0)); // RSU
+    for (uint32_t bus = 0; bus < nBuses; ++bus)
+    {
+        positionAlloc->Add(Vector(-initialDistance - bus * busSpacing, 0.0, 0.0));
+    }
     mobility.SetPositionAllocator(positionAlloc);
     mobility.SetMobilityModel("ns3::ConstantVelocityMobilityModel");
-    mobility.Install(c);
+    mobility.Install(nodes);
 
-    Ptr<ConstantVelocityMobilityModel> rsu =
-        c.Get(0)->GetObject<ConstantVelocityMobilityModel>();
-    Ptr<ConstantVelocityMobilityModel> bus =
-        c.Get(1)->GetObject<ConstantVelocityMobilityModel>();
-    rsu->SetVelocity(Vector(0.0, 0.0, 0.0));
-    bus->SetVelocity(Vector(speed, 0.0, 0.0));
+    Ptr<MobilityModel> rsuMobility = nodes.Get(0)->GetObject<MobilityModel>();
+    Ptr<ConstantVelocityMobilityModel> rsuVelocity =
+        nodes.Get(0)->GetObject<ConstantVelocityMobilityModel>();
+    rsuVelocity->SetVelocity(Vector(0.0, 0.0, 0.0));
+
+    for (uint32_t bus = 1; bus <= nBuses; ++bus)
+    {
+        Ptr<ConstantVelocityMobilityModel> model =
+            nodes.Get(bus)->GetObject<ConstantVelocityMobilityModel>();
+        model->SetVelocity(Vector(speed, 0.0, 0.0));
+    }
 
     InternetStackHelper internet;
-    internet.Install(c);
-
+    internet.Install(nodes);
     Ipv4AddressHelper ipv4;
     ipv4.SetBase("10.1.1.0", "255.255.255.0");
     ipv4.Assign(devices);
 
     TypeId tid = TypeId::LookupByName("ns3::UdpSocketFactory");
-
-    Ptr<Socket> recvSink = Socket::CreateSocket(c.Get(0), tid);
-    InetSocketAddress local = InetSocketAddress(Ipv4Address::GetAny(), 80);
-    recvSink->Bind(local);
+    Ptr<Socket> recvSink = Socket::CreateSocket(nodes.Get(0), tid);
+    recvSink->Bind(InetSocketAddress(Ipv4Address::GetAny(), 80));
     recvSink->SetRecvCallback(MakeCallback(&ReceivePacket));
 
-    Ptr<Socket> source = Socket::CreateSocket(c.Get(1), tid);
-    InetSocketAddress remote = InetSocketAddress(Ipv4Address("255.255.255.255"), 80);
-    source->SetAllowBroadcast(true);
-    source->Connect(remote);
+    // Para esta fase conserva-se UDP broadcast do prototipo com 1 BUS.
+    // A decisao broadcast/unicast sera fixada antes dos ensaios finais.
+    for (uint32_t bus = 1; bus <= nBuses; ++bus)
+    {
+        Ptr<Socket> source = Socket::CreateSocket(nodes.Get(bus), tid);
+        source->SetAllowBroadcast(true);
+        source->Connect(InetSocketAddress(Ipv4Address("255.255.255.255"), 80));
 
-    // PCAP mantido desativado: provocou uma assercao no teste com 10 MHz.
-    // wifiPhy.EnablePcap("comov", devices);
+        // Gerar desfasamento inicial aleatorio
+        Ptr<UniformRandomVariable> startJitter =
+            CreateObject<UniformRandomVariable>();
 
-    Simulator::ScheduleWithContext(source->GetNode()->GetId(),
-                                   Seconds(1),
-                                   &GenerateTraffic,
-                                   source,
-                                   packetSize,
-                                   numPackets,
-                                   interPacketInterval);
+        startJitter->SetAttribute(
+            "Min", DoubleValue(0.0));
 
+        startJitter->SetAttribute(
+            "Max", DoubleValue(interPacketInterval.GetSeconds()));
+
+        // Stream independente por autocarro
+        startJitter->SetStream(1000 + bus);
+
+        const Time start =
+            Seconds(1.0 + startJitter->GetValue());
+
+        NS_LOG_UNCOND("BUS " << bus
+                    << " | Inicio: " << start.GetSeconds() << " s");
+
+        // Agendar transmissao
+        Simulator::ScheduleWithContext(
+            nodes.Get(bus)->GetId(),
+            start,
+            &GenerateTraffic,
+            source,
+            bus,
+            rsuMobility,
+            packetSize,
+            numPackets,
+            1,
+            interPacketInterval);
+    }
+
+    // Janela comum para N=2/5/10; 0.5 s final para entrega de pacotes.
+    const double simulationSeconds = 1.0 + numPackets * interPacketInterval.GetSeconds() + 3.0;
+    Simulator::Stop(Seconds(simulationSeconds));
     Simulator::Run();
 
-    Vector busPosition = bus->GetPosition();
-    Vector rsuPosition = rsu->GetPosition();
-    double finalDistance = CalculateDistance(busPosition, rsuPosition);
-
-    double receptionRate = txPackets > 0 ? 100.0 * rxPackets / txPackets : 0.0;
-    double avgDelayMs = rxPackets > 0 ? totalDelayMs / rxPackets : 0.0;
+    const uint32_t lost = gTxPackets - gRxPackets;
+    const double reception = gTxPackets ? 100.0 * gRxPackets / gTxPackets : 0.0;
+    const double meanDelay = gRxPackets ? gTotalDelayMs / gRxPackets : 0.0;
 
     std::cout << std::fixed << std::setprecision(3);
-    std::cout << "\n========== MOBILIDADE ==========" << '\n';
-    std::cout << "Posicao final BUS: " << busPosition.x << " m\n";
-    std::cout << "Posicao final RSU: " << rsuPosition.x << " m\n";
-    std::cout << "Distancia final:   " << finalDistance << " m\n";
-    std::cout << "================================\n";
-
     std::cout << "\n========== RESULTADOS ==========" << '\n';
-    std::cout << "Pacotes enviados:  " << txPackets << '\n';
-    std::cout << "Pacotes recebidos: " << rxPackets << '\n';
-    std::cout << "Pacotes perdidos:  " << (txPackets - rxPackets) << '\n';
-    std::cout << "Taxa de rececao:   " << receptionRate << " %\n";
-    if (rxPackets > 0)
+    std::cout << "Tempo simulado:    " << Simulator::Now().GetSeconds() << " s\n";
+    std::cout << "Autocarros:        " << nBuses << '\n';
+    std::cout << "Pacotes enviados:  " << gTxPackets << '\n';
+    std::cout << "Pacotes recebidos: " << gRxPackets << '\n';
+    std::cout << "Pacotes perdidos:  " << lost << '\n';
+    std::cout << "Taxa de rececao:   " << reception << " %\n";
+    if (gRxPackets)
     {
-        std::cout << "Atraso medio:      " << avgDelayMs << " ms\n";
+        std::cout << "Atraso medio:      " << meanDelay << " ms\n";
     }
     else
     {
-        std::cout << "Atraso medio:      N/A (sem rececoes)\n";
+        std::cout << "Atraso medio:      N/A\n";
     }
+    std::cout << "\nPor autocarro:\n";
+    for (uint32_t bus = 1; bus <= nBuses; ++bus)
+    {
+        const uint32_t tx = gTxByBus[bus - 1];
+        const uint32_t rx = gRxByBus[bus - 1];
+        const double percent = tx ? 100.0 * rx / tx : 0.0;
+        std::cout << "BUS " << bus << ": TX=" << tx << " RX=" << rx
+                  << " Rececao=" << percent << "%";
+        if (rx)
+        {
+            std::cout << " Delay=" << gDelayByBus[bus - 1] / rx << " ms";
+        }
+        std::cout << '\n';
+    }
+    std::cout << "PHY RX drops RSU: " << gPhyRxDrops << "\n";
     std::cout << "================================\n";
 
     ExportCsv(outputCsv);
