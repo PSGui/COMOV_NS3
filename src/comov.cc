@@ -55,16 +55,10 @@ struct PacketData
 
 static uint32_t gPhyRxDrops = 0;
 
-static void
-OnPhyRxDrop(Ptr<const Packet> packet,
-            WifiPhyRxfailureReason reason)
+static void OnPhyRxDrop(Ptr<const Packet> packet, WifiPhyRxfailureReason reason)
 {
     ++gPhyRxDrops;
-
-    NS_LOG_UNCOND("PHY RX DROP | t="
-                  << Simulator::Now().GetSeconds()
-                  << " s | reason="
-                  << reason
+    NS_LOG_UNCOND("PHY RX DROP | t=" << Simulator::Now().GetSeconds() << " s | reason="<< reason);
 }
 
 static uint32_t gNextSeq = 0;
