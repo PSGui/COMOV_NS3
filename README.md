@@ -12,7 +12,7 @@ onde "COMOV-Projec/src/comov.cc" é o que foi clonado e "~/COMOV/ns-3/scratch/co
 
 5- ./ns3 run "scratch/comov --nBuses=2 --numPackets=200 --interval=1ms --outputCsv=resultados.csv"
 
-nBuses - Número de autocarros na simulação
-numPackets - Número de pacotes enviados por cada autocarro na simulação
-interval - intervalo de tempo entre o envio de pacotes de cada autocarro
-outputCsv - nome do ficheiro .csv que contém os dados da simulação (pode ser usado no Excell)
+nBuses - Número de autocarros na simulação  
+numPackets - Número de pacotes enviados por cada autocarro na simulação  
+interval - intervalo de tempo entre o envio de pacotes de cada autocarro  
+outputCsv - nome do ficheiro .csv que contém os dados da simulação (pode ser usado no Excell)  
